@@ -6,19 +6,26 @@ import asyncio
 from contextlib import suppress
 import logging
 import traceback
-from homeassistant.util import slugify
+
 from homeassistant.components.binary_sensor import (
     ENTITY_ID_FORMAT as BINARY_SENSOR_ENTITY_ID_FORMAT,
 )
 from homeassistant.components.switch import ENTITY_ID_FORMAT as SWITCH_ENTITY_ID_FORMAT
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.util import slugify
 
-from .const import DOMAIN
+from .const import (
+    CONF_ALARM_SERVER_HOST,
+    DOMAIN,
+    HOLIDAY_MODE,
+    NOTIFICATION_HOST_KEYS,
+    SECONDARY_COORDINATOR,
+)
 from .hikvision_device import HikvisionDevice
 from .isapi import ISAPIUnauthorizedError
 from .notifications import EventNotificationsView
@@ -74,6 +81,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HikvisionConfigEntry) ->
         hass.http.register_view(EventNotificationsView(hass))
 
     refresh_disabled_entities_in_registry(hass, device)
+    remove_orphaned_entities_from_registry(hass, entry)
 
     return True
 
@@ -175,3 +183,54 @@ def refresh_disabled_entities_in_registry(hass: HomeAssistant, device: Hikvision
     for event in device.events_info:
         update_entity(event, SWITCH_ENTITY_ID_FORMAT)
         update_entity(event, BINARY_SENSOR_ENTITY_ID_FORMAT)
+
+
+@callback
+def remove_orphaned_entities_from_registry(hass: HomeAssistant, entry: HikvisionConfigEntry) -> None:
+    """Remove entity registry entries that are no longer provided by the integration.
+
+    Keeps the registry in sync after unique_id changes or removed entities, so
+    Home Assistant does not report "This entity is no longer provided by the
+    integration".
+    """
+    device = entry.runtime_data
+    entity_registry = er.async_get(hass)
+
+    serial = device.device_info.serial_no
+    serial_slug = slugify(serial.lower())
+
+    expected: set[str] = set()
+
+    for camera in device.cameras:
+        for stream in camera.streams:
+            expected.add(slugify(f"{serial.lower()}_{stream.id}"))
+            if stream.type_id == 1:
+                expected.add(slugify(f"{serial.lower()}_{stream.id}_snapshot"))
+        for event in camera.events_info:
+            expected.add(f"switch.{event.unique_id}")
+            expected.add(f"binary_sensor.{event.unique_id}")
+
+    for event in device.events_info:
+        expected.add(f"switch.{event.unique_id}")
+        expected.add(f"binary_sensor.{event.unique_id}")
+
+    for port_no in range(1, device.capabilities.output_ports + 1):
+        expected.add(f"switch.{serial_slug}_{port_no}_alarm_output")
+
+    if device.capabilities.support_holiday_mode:
+        expected.add(f"switch.{serial_slug}_{HOLIDAY_MODE}")
+
+    if SECONDARY_COORDINATOR in device.coordinators:
+        for key in NOTIFICATION_HOST_KEYS:
+            expected.add(f"{serial}_{CONF_ALARM_SERVER_HOST}_{key}")
+        for item in device.storage:
+            expected.add(f"{serial}_{item.id}_{item.name}")
+
+    for reg_entry in er.async_entries_for_config_entry(entity_registry, entry.entry_id):
+        if reg_entry.unique_id not in expected:
+            _LOGGER.debug(
+                "Removing orphaned entity %s (unique_id: %s)",
+                reg_entry.entity_id,
+                reg_entry.unique_id,
+            )
+            entity_registry.async_remove(reg_entry.entity_id)
