@@ -19,7 +19,13 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.util import slugify
 
-from .const import DOMAIN
+from .const import (
+    CONF_ALARM_SERVER_HOST,
+    DOMAIN,
+    HOLIDAY_MODE,
+    NOTIFICATION_HOST_KEYS,
+    SECONDARY_COORDINATOR,
+)
 from .hikvision_device import HikvisionDevice
 from .isapi import ISAPIUnauthorizedError
 from .notifications import EventNotificationsView
@@ -181,19 +187,61 @@ def refresh_disabled_entities_in_registry(hass: HomeAssistant, device: Hikvision
 
 @callback
 def remove_orphaned_entities_from_registry(hass: HomeAssistant, entry: HikvisionConfigEntry) -> None:
-    """Remove enabled entity registry entries that have no live state after setup.
+    """Remove entity registry entries that are no longer provided by the integration.
 
-    Home Assistant shows "This entity is no longer provided by the integration"
-    for registry entries left behind after unique_id changes or entities the
-    integration no longer creates. Disabled entries are kept: they have no state
-    by design and are still owned by the integration.
+    Keeps the registry in sync after unique_id changes or removed entities, so
+    Home Assistant does not report "This entity is no longer provided by the
+    integration".
+
+    Camera entities are excluded from removal to preserve them when streams are
+    temporarily unavailable due to connection issues.
     """
+    from homeassistant.components.camera import DOMAIN as CAMERA_DOMAIN
+    from homeassistant.components.image import DOMAIN as IMAGE_DOMAIN
+
+    device = entry.runtime_data
     entity_registry = er.async_get(hass)
 
+    serial = device.device_info.serial_no
+    serial_slug = slugify(serial.lower())
+
+    expected: set[str] = set()
+
+    for camera in device.cameras:
+        # Add camera stream entities - preserve all camera/image entities
+        # even if streams are temporarily unavailable due to connection issues
+        for stream in camera.streams:
+            expected.add(slugify(f"{serial.lower()}_{stream.id}"))
+            if stream.type_id == 1:
+                expected.add(slugify(f"{serial.lower()}_{stream.id}_snapshot"))
+
+        for event in camera.events_info:
+            expected.add(f"switch.{event.unique_id}")
+            expected.add(f"binary_sensor.{event.unique_id}")
+
+    for event in device.events_info:
+        expected.add(f"switch.{event.unique_id}")
+        expected.add(f"binary_sensor.{event.unique_id}")
+
+    for port_no in range(1, device.capabilities.output_ports + 1):
+        expected.add(f"switch.{serial_slug}_{port_no}_alarm_output")
+
+    if device.capabilities.support_holiday_mode:
+        expected.add(f"switch.{serial_slug}_{HOLIDAY_MODE}")
+
+    if SECONDARY_COORDINATOR in device.coordinators:
+        for key in NOTIFICATION_HOST_KEYS:
+            expected.add(f"{serial}_{CONF_ALARM_SERVER_HOST}_{key}")
+        for item in device.storage:
+            expected.add(f"{serial}_{item.id}_{item.name}")
+
     for reg_entry in er.async_entries_for_config_entry(entity_registry, entry.entry_id):
-        if reg_entry.disabled:
+        # Never remove camera or image entities - they may be temporarily unavailable
+        # due to stream connectivity issues and will recover when connection is restored
+        if reg_entry.domain in (CAMERA_DOMAIN, IMAGE_DOMAIN):
             continue
-        if hass.states.get(reg_entry.entity_id) is None:
+
+        if reg_entry.unique_id not in expected:
             _LOGGER.debug(
                 "Removing orphaned entity %s (unique_id: %s)",
                 reg_entry.entity_id,
