@@ -227,7 +227,7 @@ def remove_orphaned_entities_from_registry(hass: HomeAssistant, entry: Hikvision
         expected.add(f"switch.{serial_slug}_{port_no}_alarm_output")
 
     if device.capabilities.support_holiday_mode:
-        expected.add(f"switch.{serial_slug}_{HOLIDAY_MODE}")
+        expected.add(f"{serial_slug}_{HOLIDAY_MODE}")
 
     if SECONDARY_COORDINATOR in device.coordinators:
         for key in NOTIFICATION_HOST_KEYS:
